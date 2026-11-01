@@ -48,7 +48,28 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ================= 2. 股票底层数据池（主界面 20 大核心股 + 潜力股 + 各类型细分赛道） =================
+# 统一绿涨红跌表格样式渲染器
+def style_pct_color(val):
+    """涨用绿色 #26a69a 标注，跌用红色 #ef5350 标注"""
+    try:
+        num = float(str(val).replace('%', '').replace('+', '').strip())
+        if num > 0:
+            return 'color: #26a69a; font-weight: bold;'
+        elif num < 0:
+            return 'color: #ef5350; font-weight: bold;'
+    except:
+        pass
+    return ''
+
+def apply_pct_styler(df, col_name="涨跌幅"):
+    if col_name in df.columns:
+        styler = df.style
+        func = getattr(styler, "map", getattr(styler, "applymap", None))
+        if func:
+            return func(style_pct_color, subset=[col_name])
+    return df
+
+# ================= 2. 股票底层数据池（主界面 20 大核心股 + 潜力股 + 细分赛道） =================
 CURATED_POOLS = {
     "👑 20大核心巨头 (20只)": [
         {"ticker": "NVDA", "name": "英伟达", "tag": "芯片/AI算力"},
@@ -141,7 +162,7 @@ def load_all_sec_us_stocks():
     stock_list.sort(key=lambda x: x["ticker"])
     return stock_list
 
-# ================= 4. 极速行情与资讯抓取 =================
+# ================= 4. 行情与资讯抓取 =================
 @st.cache_data(ttl=120)
 def fetch_batch_page_quotes(ticker_list):
     results = []
@@ -161,7 +182,7 @@ def fetch_batch_page_quotes(ticker_list):
             results.append({
                 "Ticker": t,
                 "现价($)": "N/A",
-                "涨跌幅": "0.00%",
+                "涨跌幅": "+0.00%",
                 "_pct_num": 0.0
             })
     return pd.DataFrame(results)
@@ -173,20 +194,24 @@ def fetch_pool_metrics(pool_name):
     for s in items:
         t = s["ticker"]
         try:
-            info = yf.Ticker(t).info
+            stock = yf.Ticker(t)
+            fi = stock.fast_info
+            price = fi.last_price or 0.0
+            prev = fi.previous_close or price
+            pct = ((price - prev) / prev * 100) if prev else 0.0
+            
+            info = stock.info
             rev_growth = info.get("revenueGrowth", 0) or 0
-            gross_margin = info.get("grossMargins", 0) or 0
             pe = info.get("forwardPE", 0) or 0
-            price = info.get("currentPrice") or info.get("regularMarketPrice", 0)
-            mcap = (info.get("marketCap", 0) or 0) / 1e9
+            mcap = (fi.market_cap or 0) / 1e9
 
             results.append({
                 "Ticker": t,
                 "公司名称": s["name"],
                 "核心业务": s["tag"],
-                "现价($)": round(price, 2),
+                "现价($)": round(float(price), 2),
+                "涨跌幅": f"{pct:+.2f}%",
                 "营收增速": f"{rev_growth * 100:.1f}%",
-                "毛利率": f"{gross_margin * 100:.1f}%",
                 "前瞻PE": round(pe, 1) if pe else "N/A",
                 "市值(B)": round(mcap, 1)
             })
@@ -296,21 +321,26 @@ def run_master_evaluation(info, hist, c_price, vix, tnx, insider_status, beat_ra
     if "增持" in insider_status: score += 8
     elif "减持" in insider_status: score -= 6
 
+    # 绿涨红跌判定
     if score >= 75:
         verdict = "强烈推荐"
-        short_bias = "看涨 🚀"
+        short_bias = "看涨 🚀 (买入信号)"
+        bias_color = "#26a69a" # 绿色
         horizon_desc = f"基本面健康扩张，估值处于合理水温，分析师目标空间达 {upside_pct:+.1f}%，短期共振偏多。"
     elif score >= 60:
         verdict = "逢低买入"
-        short_bias = "看涨 🚀"
+        short_bias = "看涨 🚀 (偏多蓄势)"
+        bias_color = "#26a69a" # 绿色
         horizon_desc = "质地优良，具备良好的安全边际，短期处于震荡偏多上行通道。"
     elif score >= 45:
         verdict = "谨慎观望"
         short_bias = "中性震荡 ⚖️"
+        bias_color = "#e3b341" # 黄色
         horizon_desc = "估值分位数偏高或短期缺乏超预期事件催化，建议等待充分回调。"
     else:
         verdict = "建议规避"
-        short_bias = "看跌 📉"
+        short_bias = "看跌 📉 (风险预警)"
+        bias_color = "#ef5350" # 红色
         horizon_desc = "估值面临压缩风险或筹码松动，短期下行修正风险未出尽。"
 
     ideal_lower = max(fifty_low, c_price * 0.88)
@@ -336,6 +366,7 @@ def run_master_evaluation(info, hist, c_price, vix, tnx, insider_status, beat_ra
         "score": min(98, max(20, score)),
         "verdict": verdict,
         "short_bias": short_bias,
+        "bias_color": bias_color,
         "horizon_desc": horizon_desc,
         "pe_percentile": pe_percentile,
         "rsi_val": rsi_val,
@@ -352,7 +383,7 @@ st.markdown("### 🧭 ReasonVest 全美股全维决策终端")
 vix_val, tnx_val = fetch_global_macro()
 col_m1, col_m2 = st.columns([2, 1])
 with col_m1:
-    st.caption(f"🌍 **宏观水温**：VIX 恐慌指数 `{vix_val}` | 美债 10年期 `{tnx_val}%`")
+    st.caption(f"🌍 **宏观水温**：VIX 恐慌指数 `{vix_val}` | 美债 10年期 `{tnx_val}%` | 【<span style='color:#26a69a;'>绿涨</span> · <span style='color:#ef5350;'>红跌</span>】", unsafe_allow_html=True)
 with col_m2:
     if st.button("🔄 刷新全网数据", use_container_width=True):
         st.cache_data.clear()
@@ -378,11 +409,12 @@ if main_mode == "🏛️ 主界面：20大核心股与分类资产":
     with st.spinner(f"加载【{selected_pool_name}】实时财务与行情..."):
         df_pool = fetch_pool_metrics(selected_pool_name)
 
-    st.dataframe(
-        df_pool[["Ticker", "公司名称", "核心业务", "现价($)", "营收增速", "毛利率", "前瞻PE", "市值(B)"]],
-        use_container_width=True,
-        hide_index=True
+    # 绿涨红跌高亮表格
+    styled_pool_df = apply_pct_styler(
+        df_pool[["Ticker", "公司名称", "核心业务", "现价($)", "涨跌幅", "营收增速", "前瞻PE", "市值(B)"]],
+        col_name="涨跌幅"
     )
+    st.dataframe(styled_pool_df, use_container_width=True, hide_index=True)
 
     chosen_ticker = st.selectbox(
         f"从上方【{selected_pool_name}】选定一只展开全维量化体检:",
@@ -396,7 +428,7 @@ else:
 
     col_l1, col_l2 = st.columns([1, 2])
     with col_l1:
-        search_letter = st.text_input("输入检索字母 (如 N, A, T...):", value="N").upper().strip()
+        search_letter = st.text_input("输入检索首字母 (如 N, A, T...):", value="N").upper().strip()
         if not search_letter:
             search_letter = "N"
 
@@ -427,12 +459,13 @@ else:
     df_page_display = pd.DataFrame(page_items)[["ticker", "name"]].rename(columns={"ticker": "Ticker", "name": "公司全称"})
     df_merged = pd.merge(df_page_display, df_page_quotes, on="Ticker", how="left")
 
-    st.markdown(f"##### 📋 【{search_letter}】开头股票列表与实时报价")
-    st.dataframe(
+    st.markdown(f"##### 📋 【{search_letter}】开头股票列表与实时报价 (绿涨·红跌)")
+    # 绿涨红跌高亮表格
+    styled_letter_df = apply_pct_styler(
         df_merged[["Ticker", "公司全称", "现价($)", "涨跌幅"]],
-        use_container_width=True,
-        hide_index=True
+        col_name="涨跌幅"
     )
+    st.dataframe(styled_letter_df, use_container_width=True, hide_index=True)
 
     chosen_ticker = st.selectbox(
         f"在【{search_letter}】列表中选中目标股票 (直接调取其专属资讯与量化体检):",
@@ -453,6 +486,10 @@ except Exception as e:
     st.error(f"标的数据拉取异常: {e}")
     st.stop()
 
+# 绿涨红跌色彩定义
+price_color = "#26a69a" if pct >= 0 else "#ef5350"
+arrow_sign = "▲" if pct >= 0 else "▼"
+
 # 标的实时核心卡片
 st.markdown(f"""
 <div class="mobile-card">
@@ -463,7 +500,7 @@ st.markdown(f"""
         </div>
         <div style="text-align:right;">
             <h2 style="margin:0; padding:0;">${c_price:.2f}</h2>
-            <span style="color:{'#26a69a' if pct>=0 else '#ef5350'}; font-weight:bold;">{pct:+.2f}%</span>
+            <span style="color:{price_color}; font-weight:bold; font-size:15px;">{arrow_sign} {pct:+.2f}%</span>
         </div>
     </div>
 </div>
@@ -488,7 +525,7 @@ with tab_eval:
             <span>评级: <b>{v_color} {eval_res['verdict']}</b></span>
         </div>
         <div style="margin-top:6px;">
-            <span>短期走势推演 (1-3月): <b>{eval_res['short_bias']}</b></span>
+            <span>短期走势推演 (1-3月): <b style="color:{eval_res['bias_color']};">{eval_res['short_bias']}</b></span>
         </div>
         <p style="margin:8px 0 0 0; font-size:13px; color:#c9d1d9; line-height:1.5;">{eval_res['horizon_desc']}</p>
     </div>
@@ -507,7 +544,7 @@ with tab_eval:
         </div>
         <div class="grid-pill">
             <span style="font-size:12px; color:#8b949e;">🎯 最佳建仓挂单区间</span><br>
-            <b style="color:#58a6ff;">{eval_res['buy_zone']}</b>
+            <b style="color:#26a69a;">{eval_res['buy_zone']}</b>
         </div>
         """, unsafe_allow_html=True)
     with g2:
@@ -555,21 +592,32 @@ with tab_news:
     else:
         st.info(f"近期暂无关于 {chosen_ticker} 的重大突发新闻。")
 
-# ================= TAB 3: 实时 K 线走势 =================
+# ================= TAB 3: 实时 K 线走势 (严格：绿涨·红跌) =================
 with tab_chart:
-    st.caption("近 1 年 K 线与历史阻力支撑位")
+    st.caption("近 1 年蜡烛图走势（阳线为绿色 ▲，阴线为红色 ▼）")
     if not hist.empty and len(hist) > 1:
         dates = pd.to_datetime(hist.index).strftime('%Y-%m-%d')
         fig = go.Figure()
         fig.add_trace(go.Candlestick(
-            x=dates, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name="K线"
+            x=dates,
+            open=hist['Open'],
+            high=hist['High'],
+            low=hist['Low'],
+            close=hist['Close'],
+            name="K线",
+            # 严格强制：绿涨、红跌
+            increasing_line_color='#26a69a',
+            increasing_fillcolor='#26a69a',
+            decreasing_line_color='#ef5350',
+            decreasing_fillcolor='#ef5350'
         ))
         fig.update_layout(
             xaxis_rangeslider_visible=False,
             height=340,
             margin=dict(l=5, r=5, t=10, b=10),
             template="plotly_dark",
-            paper_bgcolor="#181b26", plot_bgcolor="#181b26"
+            paper_bgcolor="#181b26",
+            plot_bgcolor="#181b26"
         )
         st.plotly_chart(fig, use_container_width=True)
     else:
