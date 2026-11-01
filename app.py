@@ -2,11 +2,12 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 import pandas as pd
+from datetime import datetime
 
 # ================= 1. 移动端原生视口与主题注入 =================
 st.set_page_config(
-    page_title="ReasonVest - 美股量化推理终端",
-    page_icon="📈",
+    page_title="ReasonVest Pro - 美股量化与入场时机终端",
+    page_icon="🧭",
     layout="centered",
     initial_sidebar_state="collapsed"
 )
@@ -78,113 +79,101 @@ def fetch_screener_data():
             continue
     return pd.DataFrame(results)
 
-@st.cache_data(ttl=300)
-def fetch_stock_details(ticker):
-    """安全拉取单只股票详情，保证返回有效对象"""
+@st.cache_data(ttl=180)
+def fetch_stock_full_package(ticker):
+    """安全拉取股票的所有数据：行情、K线、财报、新闻、财报日历"""
     stock = yf.Ticker(ticker)
     info = stock.info or {}
     
-    # 稳健获取K线数据
     try:
         hist = stock.history(period="6mo")
     except:
         hist = pd.DataFrame()
         
-    # 稳健获取财报数据
     try:
         fin = stock.financials
-        if fin is None:
-            fin = pd.DataFrame()
+        if fin is None: fin = pd.DataFrame()
     except:
         fin = pd.DataFrame()
 
-    return info, hist, fin
+    # 抓取外媒新闻 (Reuters, CNBC, Bloomberg 等合作源)
+    try:
+        news = stock.news or []
+    except:
+        news = []
 
-# ================= 3. 核心量化推理算法 =================
-def run_quant_reasoning(info, c_price):
-    rev_growth = info.get("revenueGrowth", 0) or 0
-    gross_margin = info.get("grossMargins", 0) or 0
-    pe = info.get("forwardPE", 0) or 0
+    # 抓取下一次财报会议日期
+    try:
+        calendar = stock.calendar
+    except:
+        calendar = {}
+
+    return info, hist, fin, news, calendar
+
+# ================= 3. 最佳入手时机测算模型 (Entry Timing Model) =================
+def compute_best_entry_timing(info, hist, c_price):
+    """
+    推导何时入手最值得：
+    结合：RSI(14)、200日均线、华尔街目标价折扣、52周支撑位
+    """
+    fifty_low = info.get("fiftyTwoWeekLow", c_price * 0.75) or (c_price * 0.75)
     target_median = info.get("targetMedianPrice", c_price) or c_price
-    short_ratio = info.get("shortRatio", 0) or 0
-    fifty_low = info.get("fiftyTwoWeekLow", c_price * 0.7) or (c_price * 0.7)
-
     upside_pct = ((target_median - c_price) / c_price * 100) if c_price else 0
 
-    score = 50
-    if rev_growth > 0.25: score += 20
-    elif rev_growth > 0.10: score += 10
-    elif rev_growth < 0: score -= 20
+    # 1. 计算 RSI (相对强弱指标)
+    rsi_val = 50.0
+    sma_50 = c_price
+    sma_200 = c_price
+    if not hist.empty and len(hist) >= 15:
+        delta = hist['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / (loss + 1e-9)
+        rsi_series = 100 - (100 / (1 + rs))
+        rsi_val = rsi_series.iloc[-1] if not pd.isna(rsi_series.iloc[-1]) else 50.0
 
-    if gross_margin > 0.50: score += 15
-    elif gross_margin < 0.20: score -= 15
+        if len(hist) >= 50:
+            sma_50 = hist['Close'].rolling(50).mean().iloc[-1]
+        if len(hist) >= 120:
+            sma_200 = hist['Close'].rolling(120).mean().iloc[-1]
 
-    if upside_pct > 20: score += 15
-    elif upside_pct < 0: score -= 15
+    # 2. 测算最佳入手区间 (Buy Zone)
+    # 策略：以近期的技术支撑位与合理安全边际计算
+    ideal_lower_entry = max(fifty_low, c_price * 0.88)
+    ideal_upper_entry = min(c_price * 0.96, (sma_50 if sma_50 > 0 else c_price))
+    if ideal_upper_entry <= ideal_lower_entry:
+        ideal_upper_entry = c_price * 0.98
+        ideal_lower_entry = c_price * 0.90
 
-    if pe and pe > 60: score -= 10
-
-    if score >= 75:
-        verdict = "强烈推荐"
-        short_bias = "看涨"
-        horizon = f"机构一致目标价空间达 {upside_pct:+.1f}%，高增长有望持续催化估值重估。"
-    elif score >= 60:
-        verdict = "逢低买入"
-        short_bias = "看涨"
-        horizon = "基本面健康，现价具备合理安全边际，短期以震荡上行为主。"
-    elif score >= 45:
-        verdict = "谨慎观望"
-        short_bias = "震荡"
-        horizon = "当前估值已充分计入业绩，短期缺乏超预期催化剂，建议等待回调。"
+    # 3. 研判当前入场时机评级
+    # 条件A: RSI < 38 严重超跌
+    # 条件B: 离目标价有 > 25% 空间
+    # 条件C: 价格接近支撑位
+    if rsi_val < 38 and upside_pct > 20:
+        timing_status = "🔥 极佳买点（黄金超跌买入区）"
+        action_advice = f"技术面 RSI 出现严重超卖信号 ({rsi_val:.1f})，且华尔街目标价有 {upside_pct:+.1f}% 空间，此时入手盈亏比极高，建议立即分批建仓。"
+    elif c_price <= ideal_upper_entry:
+        timing_status = "✅ 适合分批吸筹（处于安全边际内）"
+        action_advice = f"当前价格已进入量化模型测算的建仓区间 (${ideal_lower_entry:.2f} ~ ${ideal_upper_entry:.2f})，可采取【三批建仓法】逢低配置。"
+    elif rsi_val > 70:
+        timing_status = "⚠️ 严重超买（切勿追高追涨）"
+        action_advice = f"短期 RSI 指标高达 {rsi_val:.1f}，动能严重超买透支，追高极易被套！**最值得入手的时机是耐心等待价格回踩至 ${ideal_upper_entry:.2f} 附近再考虑入场**。"
     else:
-        verdict = "建议规避"
-        short_bias = "看跌"
-        horizon = "基本面增速承压或估值偏高，短期存在均值回归回调压力。"
-
-    pros = []
-    if rev_growth > 0.15:
-        pros.append(f"**业绩爆发力强**：最新营收同比增速达 {rev_growth*100:.1f}%，领跑赛道。")
-    else:
-        pros.append(f"**现金流稳健**：核心业务抗风险能力强，具备成熟运营壁垒。")
-
-    if gross_margin > 0.40:
-        pros.append(f"**产品定价权强**：毛利率达 {gross_margin*100:.1f}%，具备较深产业护城河。")
-    else:
-        pros.append(f"**赛道放量中**：受益于行业渗透率提升，规模化优势初显。")
-
-    if upside_pct > 0:
-        pros.append(f"**目标空间充足**：分析师中位数目标价为 ${target_median:.2f}，潜在空间 {upside_pct:+.1f}%。")
-    else:
-        pros.append(f"**机构筹码稳定**：主力资金关注度高，流动性极佳。")
-
-    cons = []
-    if pe and pe > 35:
-        cons.append(f"**估值容错率低**：前瞻 PE 达 {pe:.1f}x，若下季财报指引轻微不及预期，易引发回撤。")
-    else:
-        cons.append(f"**增量催化不足**：估值中枢相对平稳，需新产品线放量方可打破震荡。")
-
-    if short_ratio and short_ratio > 3.0:
-        cons.append(f"**空头对冲压力**：空头回补天数为 {short_ratio:.1f} 天，存在阶段性做空博弈。")
-    else:
-        cons.append(f"**宏观波动传导**：容易受美联储利率政策与科技大盘情绪联动扰动。")
-
-    cons.append(f"**竞争替代风险**：行业竞争激烈，需持续关注核心大客户流失风险。")
-
-    stop_loss_price = max(fifty_low, c_price * 0.88)
-    stop_loss = f"若股价放量跌破技术支撑位 **${stop_loss_price:.2f}**（或下季营收增速断崖跌破 10%），说明上行逻辑破坏，需坚决止损。"
+        timing_status = "⏳ 观望等待（等待更低挂单点）"
+        action_advice = f"当前处于震荡观望区间，建议保持耐心，把限价买单挂在 **${ideal_lower_entry:.2f} - ${ideal_upper_entry:.2f}** 区间静待回踩。"
 
     return {
-        "verdict": verdict,
-        "short_bias": short_bias,
-        "horizon": horizon,
-        "summary": f"量化评分: {score}/100。毛利率: {gross_margin*100:.1f}%, 增速: {rev_growth*100:.1f}%。",
-        "pros": pros,
-        "cons": cons,
-        "stop_loss": stop_loss
+        "timing_status": timing_status,
+        "action_advice": action_advice,
+        "buy_zone_low": round(ideal_lower_entry, 2),
+        "buy_zone_high": round(ideal_upper_entry, 2),
+        "rsi": round(rsi_val, 1),
+        "upside_pct": round(upside_pct, 1),
+        "sma_50": round(sma_50, 2)
     }
 
-# ================= 4. 主界面交互 =================
-st.markdown("### 🧭 ReasonVest 美股量化决策终端")
+# ================= 4. 主界面渲染 =================
+st.markdown("### 🧭 ReasonVest 美股全维决策终端")
 
 category_filter = st.radio(
     "板块分类切换",
@@ -219,22 +208,22 @@ current_ticker = manual_search if manual_search else selected_ticker
 st.markdown("---")
 
 try:
-    with st.spinner(f"正在加载 {current_ticker}..."):
-        stock_info, hist_data, financials = fetch_stock_details(current_ticker)
-        c_price = stock_info.get("currentPrice") or stock_info.get("regularMarketPrice", 0.0)
-        p_close = stock_info.get("previousClose", c_price)
+    with st.spinner(f"正在全维追踪 {current_ticker} 的行情、新闻、财报会议..."):
+        info, hist, fin, news_list, calendar = fetch_stock_full_package(current_ticker)
+        c_price = info.get("currentPrice") or info.get("regularMarketPrice", 0.0)
+        p_close = info.get("previousClose", c_price)
         pct = ((c_price - p_close) / p_close * 100) if p_close else 0.0
 except Exception as e:
-    st.error(f"代码输入有误或数据拉取失败: {e}")
+    st.error(f"数据拉取失败，请检查 Ticker: {e}")
     st.stop()
 
-# 顶部核心信息条
+# 顶部核心信息卡片
 st.markdown(f"""
 <div class="mobile-card">
     <div style="display:flex; justify-content:space-between; align-items:center;">
         <div>
-            <h2 style="margin:0; padding:0;">{stock_info.get('shortName', current_ticker)} ({current_ticker})</h2>
-            <span style="color:#8b949e; font-size:13px;">{stock_info.get('sector', '未知行业')} · {stock_info.get('industry', '')}</span>
+            <h2 style="margin:0; padding:0;">{info.get('shortName', current_ticker)} ({current_ticker})</h2>
+            <span style="color:#8b949e; font-size:13px;">{info.get('sector', '未知行业')} · {info.get('industry', '')}</span>
         </div>
         <div style="text-align:right;">
             <h2 style="margin:0; padding:0;">${c_price:.2f}</h2>
@@ -244,114 +233,114 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-tab_reason, tab_chart, tab_fin = st.tabs(["🧠 量化决策推导", "📈 实时K线走势", "📑 财报明细数据"])
+# 四大核心模块标签页
+tab_entry, tab_news, tab_reason, tab_chart = st.tabs([
+    "🎯 最佳入手时机", 
+    "📰 实时外媒新闻与会议", 
+    "🧠 多空综合评价", 
+    "📈 实时K线走势"
+])
 
-# ------------ TAB 1: 免 API Key 量化推理 ------------
-with tab_reason:
-    st.write("点击下方按钮，系统将**直接运行量化逻辑**推导多空对抗分析：")
+# ------------ TAB 1: 核心需求 - 最佳入手时机测算 ------------
+with tab_entry:
+    st.markdown("#### 🎯 量化测算：什么时候入手最值得？")
+    timing = compute_best_entry_timing(info, hist, c_price)
+
+    st.markdown(f"""
+    <div class="mobile-card">
+        <h4 style="margin:0 0 8px 0; color:#e6edf3;">当前买入时机评级：</h4>
+        <h3 style="margin:0 0 12px 0;">{timing['timing_status']}</h3>
+        <p style="font-size:14px; color:#c9d1d9; line-height:1.6;">{timing['action_advice']}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c_b1, c_b2 = st.columns(2)
+    with c_b1:
+        st.metric("🎯 最佳建仓挂单区间", f"${timing['buy_zone_low']} - ${timing['buy_zone_high']}")
+    with c_b2:
+        st.metric("RSI(14) 超买超卖指标", f"{timing['rsi']}", "超卖 (<35) / 超买 (>70)")
+
+    st.info(f"""
+    💡 **最稳妥的入手操作法则**：
+    1. **拒绝追高**：如果当前价格高于 **${timing['buy_zone_high']}**，不要市价急于追入；
+    2. **埋伏挂单**：将首笔买入资金（如 30%）挂在 **${timing['buy_zone_high']}**，次笔资金挂在 **${timing['buy_zone_low']}**；
+    3. **破位保护**：一旦放量跌破 **${timing['buy_zone_low'] * 0.95:.2f}**，立即停止补仓，防范假摔变成破位下行。
+    """)
+
+# ------------ TAB 2: 核心需求 - 实时外媒新闻与财报会议追踪 ------------
+with tab_news:
+    st.markdown("#### 📅 财报会议与事件日历")
+    # 解析财报日期
+    earnings_date_str = "暂无公布"
+    if isinstance(calendar, dict) and "Earnings Date" in calendar:
+        e_dates = calendar["Earnings Date"]
+        if e_dates:
+            earnings_date_str = str(e_dates[0])
     
-    if st.button("🚀 运行针对该标的的量化推理", type="primary", use_container_width=True):
-        data = run_quant_reasoning(stock_info, c_price)
+    st.markdown(f"""
+    <div class="mobile-card">
+        <span style="color:#8b949e; font-size:13px;">下一次财报发布与业绩电话会议 (Earnings Call)</span>
+        <h3 style="margin:6px 0 0 0; color:#58a6ff;">📆 {earnings_date_str}</h3>
+        <p style="font-size:12px; color:#8b949e; margin-top:4px;">*注：若距离财报会不足 7 个交易日，请严格控制仓位，避免盲盒暴击风险。</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-        v_color = "🟢" if ("推荐" in data['verdict'] or "买入" in data['verdict']) else ("🔴" if "规避" in data['verdict'] else "🟡")
-        bias_badge = "🚀 看涨" if data['short_bias'] == "看涨" else ("📉 看跌" if data['short_bias'] == "看跌" else "⚖️ 震荡")
+    st.markdown("#### 📰 实时外媒财经新闻头条 (Reuters / CNBC / Bloomberg)")
+    if news_list:
+        for item in news_list[:8]: # 展示最新8条新闻
+            # 兼容不同 yfinance 版本的 news 字典结构
+            title = item.get("title") or item.get("content", {}).get("title", "新闻标题")
+            publisher = item.get("publisher") or item.get("content", {}).get("provider", {}).get("displayName", "权威外媒")
+            link = item.get("link") or item.get("content", {}).get("canonicalUrl", {}).get("url", "#")
+            pub_time = item.get("providerPublishTime")
+            time_str = datetime.fromtimestamp(pub_time).strftime('%m-%d %H:%M') if pub_time else "最新"
 
-        st.markdown(f"""
-        <div class="mobile-card">
-            <div style="display:flex; justify-content:space-between; margin-bottom:8px;">
-                <span>综合投资评价: <b>{v_color} {data['verdict']}</b></span>
-                <span>短期视角 (1-3月): <b>{bias_badge}</b></span>
+            st.markdown(f"""
+            <div style="border-bottom:1px solid #21262d; padding:10px 0;">
+                <span style="background:#21262d; color:#8b949e; font-size:11px; padding:2px 6px; border-radius:4px;">{publisher} · {time_str}</span>
+                <div style="margin-top:6px;">
+                    <a href="{link}" target="_blank" style="color:#58a6ff; text-decoration:none; font-size:14px; font-weight:500;">{title}</a>
+                </div>
             </div>
-            <p style="margin:4px 0; font-size:14px; color:#e6edf3;"><b>综合定量评价</b>: {data['summary']}</p>
-            <p style="margin:4px 0; font-size:13px; color:#8b949e;"><b>短期走势推演</b>: {data['horizon']}</p>
-        </div>
-        """, unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
+    else:
+        st.info("近期暂无该标的重大突发外媒新闻更新。")
 
-        st.success("### ✅ 为什么推荐它 (做多驱动)")
-        for p in data['pros']:
-            st.markdown(p)
+# ------------ TAB 3: 多空综合定量评价 ------------
+with tab_reason:
+    st.markdown("#### 🧠 核心财务与量化多空对抗")
+    rev_growth = info.get("revenueGrowth", 0) or 0
+    gross_margin = info.get("grossMargins", 0) or 0
+    pe = info.get("forwardPE", 0) or 0
+    target_median = info.get("targetMedianPrice", c_price) or c_price
+    upside_pct = ((target_median - c_price) / c_price * 100) if c_price else 0
 
-        st.error("### ❌ 为什么不推荐它 (核心风险)")
-        for c in data['cons']:
-            st.markdown(c)
+    st.success("### ✅ 为什么推荐它 (做多逻辑)")
+    st.markdown(f"1. **业绩增长支撑**：最新季度营收同比增速达 **{rev_growth*100:.1f}%**，基本面维持扩张。")
+    st.markdown(f"2. **毛利护城河**：毛利率达 **{gross_margin*100:.1f}%**，在细分领域具备产品自主定价权。")
+    st.markdown(f"3. **机构目标空间**：华尔街一致预期目标价为 **${target_median:.2f}** (潜在空间: {upside_pct:+.1f}%)。")
 
-        st.warning(f"🚨 **逻辑证伪红线**：{data['stop_loss']}")
+    st.error("### ❌ 为什么不推荐它 (核心风险)")
+    st.markdown(f"1. **估值溢价压力**：前瞻 PE 为 **{pe:.1f}x**，业绩稍有不及预期容易产生估值下杀。")
+    st.markdown(f"2. **宏观联动风险**：美联储宏观流动性预期波动可能对科技/高成长股估值带来系统性压制。")
+    st.markdown(f"3. **黑天鹅与竞争**：密切追踪外媒新闻中关于竞品替代、监管反垄断或主要客户砍单的异动。")
 
-# ------------ TAB 2: 防崩溃 K 线走势图 ------------
+# ------------ TAB 4: K 线走势 ------------
 with tab_chart:
-    st.caption("近 6 个月行情走势（支持手指双指缩放查看细节）")
-    if not hist_data.empty and len(hist_data) > 1:
-        try:
-            # 清洗时间戳时区，避免前端解析成空白
-            dates = pd.to_datetime(hist_data.index).strftime('%Y-%m-%d')
-            
-            fig = go.Figure()
-            # 绘制专业蜡烛图 K 线
-            fig.add_trace(go.Candlestick(
-                x=dates,
-                open=hist_data['Open'],
-                high=hist_data['High'],
-                low=hist_data['Low'],
-                close=hist_data['Close'],
-                name="K线"
-            ))
-            fig.update_layout(
-                xaxis_rangeslider_visible=False,
-                height=350,
-                margin=dict(l=5, r=5, t=10, b=10),
-                template="plotly_dark",
-                paper_bgcolor="#181b26",
-                plot_bgcolor="#181b26"
-            )
-            # 正确完整的绘图调用
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            # 万一蜡烛图绘制遇到极端数据，自动降级为折线图，确保绝对有图
-            fig_line = go.Figure()
-            fig_line.add_trace(go.Scatter(x=hist_data.index, y=hist_data['Close'], mode='lines', name='收盘价', line=dict(color='#26a69a', width=2)))
-            fig_line.update_layout(height=350, template="plotly_dark", margin=dict(l=5, r=5, t=10, b=10))
-            st.plotly_chart(fig_line, use_container_width=True)
+    st.caption("近 6 个月 K 线与均线支撑")
+    if not hist.empty and len(hist) > 1:
+        dates = pd.to_datetime(hist.index).strftime('%Y-%m-%d')
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=dates, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name="K线"
+        ))
+        fig.update_layout(
+            xaxis_rangeslider_visible=False,
+            height=340,
+            margin=dict(l=5, r=5, t=10, b=10),
+            template="plotly_dark",
+            paper_bgcolor="#181b26", plot_bgcolor="#181b26"
+        )
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.warning("⚠️ 暂未获取到近期交易日 K 线数据（可能为周末休市或网络延迟），请稍后重试。")
-
-# ------------ TAB 3: 深度财报明细数据 ------------
-with tab_fin:
-    st.markdown("#### 核心财务健康度")
-    fc1, fc2 = st.columns(2)
-    fc1.metric("毛利率 (Gross Margin)", f"{(stock_info.get('grossMargins', 0) or 0) * 100:.1f}%")
-    fc2.metric("净利率 (Profit Margin)", f"{(stock_info.get('profitMargins', 0) or 0) * 100:.1f}%")
-    
-    fc3, fc4 = st.columns(2)
-    fc3.metric("营收同比增速 (YoY)", f"{(stock_info.get('revenueGrowth', 0) or 0) * 100:.1f}%")
-    fc4.metric("动态市盈率 (Forward PE)", f"{stock_info.get('forwardPE', 'N/A')}")
-
-    st.markdown("---")
-    st.markdown("#### 最新年度损益表核心明细 (单位: 百万美元)")
-    
-    if not financials.empty:
-        try:
-            # 过滤只显示主要财务条目
-            clean_fin = financials.copy()
-            # 将列名格式化为年份
-            clean_fin.columns = [pd.to_datetime(c).strftime('%Y年') for c in clean_fin.columns]
-            
-            # 安全转为数值型，防止字符串造成崩溃
-            clean_fin = clean_fin.apply(pd.to_numeric, errors='coerce').fillna(0)
-            clean_fin = clean_fin / 1e6 # 换算为百万美元
-
-            # 筛选投资者最关注的核心财务科目
-            key_index = [idx for idx in clean_fin.index if any(k in str(idx) for k in [
-                'Total Revenue', 'Operating Revenue', 'Cost Of Revenue', 'Gross Profit', 
-                'Operating Income', 'Net Income', 'EBITDA'
-            ])]
-            
-            if key_index:
-                display_df = clean_fin.loc[key_index]
-            else:
-                display_df = clean_fin.head(6)
-
-            st.dataframe(display_df.style.format("{:,.1f}"), use_container_width=True)
-        except Exception:
-            st.info("财报明细表格正在同步中，上方财务指标已是最新状态。")
-    else:
-        st.info("该标的暂时没有公开详细年度损益表，可直接参考上方的核心财务比率。")
+        st.warning("暂未获取到近期交易日 K 线。")
