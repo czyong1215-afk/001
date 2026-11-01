@@ -168,7 +168,6 @@ def fetch_global_macro_and_news():
 
 @st.cache_data(ttl=300)
 def fetch_pool_metrics(pool_name):
-    """批量抓取所选板块的基本面与行情"""
     items = CURATED_POOLS.get(pool_name, [])
     results = []
     for s in items:
@@ -368,23 +367,67 @@ st.dataframe(
 
 st.markdown("---")
 
-# 搜索与选股：支持直接选当前分类，也可搜索全美股 8000+ 标的
-st.markdown("#### 🔍 标的深度聚焦与全美股检索")
+# ================= 核心升级：A-Z 首字母快速检索系统 =================
+st.markdown("#### 🔤 全美股智能检索 (支持首字母 A-Z 快速定位)")
 
 with st.spinner("同步 SEC 全美股官方代码库 (8000+ 标的)..."):
     all_sec_stocks = load_all_sec_us_stocks()
 
-col_sel1, col_sel2 = st.columns([1, 1])
-with col_sel1:
-    quick_select = st.selectbox("从上方分类列表中选定:", df_pool["Ticker"].tolist() if not df_pool.empty else ["NVDA"])
-with col_sel2:
-    search_options = ["(不使用自由检索，使用左侧所选)"] + list(all_sec_stocks.keys())
-    free_search = st.selectbox("或直接搜索全美股任意 8000+ 标的:", options=search_options, index=0)
+# 字母索引选择器与自由搜索联动
+c_letter, c_stock = st.columns([1, 2])
 
-if free_search != "(不使用自由检索，使用左侧所选)":
+with c_letter:
+    alphabet_list = ["全部 (ALL)"] + [chr(i) for i in range(65, 91)] + ["0-9"]
+    selected_letter = st.selectbox(
+        "🔤 首字母索引:",
+        options=alphabet_list,
+        index=0,
+        help="点击任意字母，右侧将瞬间过滤出所有以该字母开头的股票"
+    )
+
+# 根据所选字母即时过滤 8000+ 标的
+all_labels = sorted(list(all_sec_stocks.keys()))
+if selected_letter == "全部 (ALL)":
+    filtered_labels = all_labels
+elif selected_letter == "0-9":
+    filtered_labels = [lbl for lbl in all_labels if lbl[0].isdigit()]
+else:
+    filtered_labels = [lbl for lbl in all_labels if lbl.startswith(selected_letter)]
+
+with c_stock:
+    # 动态提示当前字母下的股票总数
+    search_prompt = f"在【{selected_letter}】中选择 (共 {len(filtered_labels)} 只):"
+    dropdown_options = ["(使用上方分类所选标的)"] + filtered_labels
+    
+    # 智能默认选项
+    default_select_idx = 0
+    if selected_letter == "N":
+        for i, opt in enumerate(dropdown_options):
+            if opt.startswith("NVDA "):
+                default_select_idx = i
+                break
+    elif selected_letter == "A":
+        for i, opt in enumerate(dropdown_options):
+            if opt.startswith("AAPL "):
+                default_select_idx = i
+                break
+    elif selected_letter == "T":
+        for i, opt in enumerate(dropdown_options):
+            if opt.startswith("TSLA "):
+                default_select_idx = i
+                break
+
+    free_search = st.selectbox(
+        search_prompt,
+        options=dropdown_options,
+        index=default_select_idx
+    )
+
+# 确定最终用户选中的 Ticker
+if free_search != "(使用上方分类所选标的)":
     chosen_ticker = all_sec_stocks[free_search]
 else:
-    chosen_ticker = quick_select
+    chosen_ticker = df_pool["Ticker"].iloc[0] if not df_pool.empty else "NVDA"
 
 # 深度拉取选中标的的所有维数
 try:
