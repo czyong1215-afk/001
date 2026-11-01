@@ -284,4 +284,4 @@ with tab_chart:
             margin=dict(l=5, r=5, t=10, b=10),
             template="plotly_dark"
         )
-        st.plotly_ch
+        st.plotly_chart
